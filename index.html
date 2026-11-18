@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TERMINAL // ORACLE-9</title>
+<style>
+  :root {
+    --phos: #33ff66;
+    --dim:  #1a8033;
+    --bg:   #030805;
+    --warn: #ffcc33;
+    --err:  #ff5555;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--phos);
+    font-family: "Courier New", Courier, monospace;
+    display: flex;
+    justify-content: center;
+    padding: 18px;
+    overflow: hidden;
+  }
+  /* subtle CRT curvature vignette + scanlines */
+  body::before {
+    content: "";
+    position: fixed; inset: 0; pointer-events: none; z-index: 9;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px,
+      rgba(0,0,0,0.22) 3px
+    );
+  }
+  body::after {
+    content: "";
+    position: fixed; inset: 0; pointer-events: none; z-index: 10;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 60%, rgba(0,0,0,0.55) 100%);
+  }
+  #frame {
+    width: min(860px, 100%);
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    text-shadow: 0 0 6px rgba(51,255,102,0.55);
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    border-bottom: 1px solid var(--dim);
+    padding-bottom: 6px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  header b { letter-spacing: 3px; }
+  #r { color: var(--dim); font-size: 12px; }
+  #topbar { display: flex; gap: 8px; align-items: center; font-size: 12px; margin-bottom: 8px; }
+  #topbar label { color: var(--dim); letter-spacing: 1px; }
+  select, #key {
+    background: #041208;
+    border: 1px solid var(--dim);
+    color: var(--phos);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 3px 6px;
+    outline: none;
+  }
+  #key { flex: 1; min-width: 120px; }
+  #key::placeholder { color: var(--dim); }
+  #out {
+    flex: 1;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 14px;
+    line-height: 1.45;
+    padding-right: 6px;
+  }
+  #out .user  { color: #ffffff; }
+  #out .dim   { color: var(--dim); }
+  #out .warn  { color: var(--warn); }
+  #out .err   { color: var(--err); }
+  #inrow {
+    display: flex; align-items: center; gap: 8px;
+    border-top: 1px solid var(--dim);
+    padding-top: 8px; margin-top: 8px;
+  }
+  #prompt { white-space: nowrap; }
+  #in {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--phos);
+    font-family: inherit;
+    font-size: 15px;
+    caret-color: var(--phos);
+    text-shadow: inherit;
+  }
+  cursor { display: inline-block; width: 9px; height: 16px; background: var(--phos); animation: blink 1s steps(1) infinite; vertical-align: -2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #status { font-size: 11px; color: var(--dim); letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<div id="frame">
+  <header>
+    <b>ORACLE-9 CONSULTATION TERMINAL</b>
+    <span id="r">v0.1 // free-tier test build</span>
+  </header>
+
+  <div id="topbar">
+    <label for="key">KEY:</label>
+    <input id="key" type="password" placeholder="paste Gemini API key (aistudio.google.com/apikey)" spellcheck="false" />
+    <label for="model">MODEL:</label>
+    <select id="model">
+      <option value="">loading available models…</option>
+    </select>
+    <span id="status">IDLE</span>
+  </div>
+
+  <div id="out"></div>
+
+  <div id="inrow">
+    <span id="prompt">PRESENT QUESTION&gt;</span>
+    <input id="in" autocomplete="off" spellcheck="false" />
+    <cursor></cursor>
+  </div>
+</div>
+
+<script>
+(function () {
+  const keyEl   = document.getElementById('key');
+  const modelEl = document.getElementById('model');
+  const statusEl= document.getElementById('status');
+  const out     = document.getElementById('out');
+  const inEl    = document.getElementById('in');
+  let history = [];          // conversation memory
+  let busy = false;
+
+  // restore saved key
+  keyEl.value = localStorage.getItem('oracle9_key') || '';
+  keyEl.addEventListener('change', async () => {
+    localStorage.setItem('oracle9_key', keyEl.value.trim());
+    await loadModels();
+  });
+
+  // fetch models this key can actually use, so the list never goes stale
+  async function loadModels() {
+    const key = keyEl.value.trim();
+    modelEl.innerHTML = '<option value="">(paste API key to load models)</option>';
+    if (!key) return;
+    try {
+      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', {
+        headers: { 'x-goog-api-key': key }
+      });
+      if (!res.ok) {
+        modelEl.innerHTML = '<option value="">model list failed (HTTP ' + res.status + ')</option>';
+        return;
+      }
+      const data = await res.json();
+      const all = (data.models || []).map(m => m.name.replace(/^models\//, ''));
+      // WHITELIST instead of blacklist: free-chat models are numbered flash /
+      // flash-lite variants, their -latest aliases, and gemma text models.
+      // Everything else (pro/ultra tiers, 4-argon/-carbon/-hydrogen, computer-use,
+      // robotics, transcribe, omni, nano-banana, embeddings...) stays out.
+      const keep = /^(gemini-)?(\d+(\.\d+)?-)?(flash|flash-lite)(-preview(-\d+)*)?(-latest)?$|^gemma-[\w.-]+-it$/;
+      const usable = all.filter(m => keep.test(m)).sort();
+      if (!usable.length) {
+        modelEl.innerHTML = '<option value="">list came back but nothing usable (saw ' + all.length + ' models)</option>';
+        console.log('ORACLE9 model dump:', all);
+        return;
+      }
+      modelEl.innerHTML = usable.map(m => '<option value="' + m + '">' + m.replace(/^gemini-/, '') + '</option>').join('');
+      const saved = localStorage.getItem('oracle9_model');
+      // newest flash first: some listed models (e.g. 2.5-flash) are not callable for new accounts
+      if (usable.includes('gemini-3.8-flash')) modelEl.value = 'gemini-3.8-flash';
+      else if (saved && usable.includes(saved)) modelEl.value = saved;
+      else modelEl.value = usable.find(m => m.includes('flash')) || usable[0];
+    } catch (e) {
+      modelEl.innerHTML = '<option value="">model list failed: ' + e.message + '</option>';
+    }
+  }
+  modelEl.addEventListener('change', () => localStorage.setItem('oracle9_model', modelEl.value));
+  if (keyEl.value.trim()) loadModels();
+
+  function line(text, cls) {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = text;
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+    return span;
+  }
+  const scroll = () => { out.scrollTop = out.scrollHeight; };
+
+  // boot sequence
+  line('ORACLE-9 BIOS v4.2 ... OK\n', 'dim');
+  line('PHOSPHOR ARRAY ............ OK\n', 'dim');
+  line('ORACULAR SUBSYSTEM ........ PENDING CREDENTIALS\n', 'warn');
+  line('\nConsult the Oracle by typing below.\nCommands: /clear resets memory, /help lists this.\n\n', 'dim');
+
+  async function send(text) {
+    if (busy) return;
+    const key = keyEl.value.trim();
+    if (!key) {
+      line('!! ORACLE IS SILENT. Insert API key in the field above.\n   Get one free at https://aistudio.google.com/apikey\n\n', 'err');
+      return;
+    }
+    busy = true;
+    statusEl.textContent = 'CONSULTING...';
+
+    if (text === '/clear') {
+      history = [];
+      line('ORACULAR MEMORY SEVERED.\n\n', 'warn');
+      busy = false; statusEl.textContent = 'IDLE';
+      return;
+    }
+    if (text === '/help') {
+      line('\nHELP: type any question. /clear wipes the Oracle memory.\nKey + model are saved in this browser only.\nFree tier: prompts may be stored by Google — no secrets.\n\n', 'warn');
+      busy = false; statusEl.textContent = 'IDLE';
+      return;
+    }
+
+    line('YOU> ' + text + '\n', 'user');
+    line('\nORACLE> \n', 'dim');
+
+    history.push({ role: 'user', parts: [{ text }] });
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    try {
+      // retry loop: handles retired-model swaps and temporary 503 overload
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        const url = 'https://generativelanguage.googleapis.com/v1beta/models/'
+          + modelEl.value + ':streamGenerateContent?alt=sse';
+        const ctrl = new AbortController();
+        const FETCH_TIMEOUT_MS = 60000;
+        const timer = setTimeout(() => ctrl.abort('timeout'), FETCH_TIMEOUT_MS);
+        try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify({ contents: history }),
+          signal: ctrl.signal
+        });
+
+        if (!res.ok) {
+          const detail = await res.text();
+
+          // Google names a replacement when a model is retired: swap and retry
+          const m = detail.match(/Please update your code to use models\/([\w.\-]+)/);
+          if (m && m[1] !== modelEl.value) {
+            line('!! model retired — switching to ' + m[1] + '\n', 'warn');
+            modelEl.value = m[1];
+            localStorage.setItem('oracle9_model', m[1]);
+            continue;
+          }
+
+          // 503 overload: temporary, wait and retry
+          if (res.status === 503 && attempt < 4) {
+            const wait = attempt * 4000;
+            line('(high demand — retrying in ' + wait / 1000 + 's)\n', 'warn');
+            await sleep(wait);
+            continue;
+          }
+
+          line('\n!! THE ORACLE REFUSES (HTTP ' + res.status + ')\n' + detail.slice(0, 400) + '\n\n', 'err');
+          history.pop();
+          break;
+        }
+
+        // stream SSE chunks, typewriter output
+        const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '', answer = '', target = out.lastChild;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const events = buf.split('\n\n');
+        buf = events.pop();
+        for (const ev of events) {
+          const data = ev.split('\n').find(l => l.startsWith('data:'));
+          if (!data) continue;
+          try {
+            const json = JSON.parse(data.slice(5).trim());
+            const parts = json.candidates?.[0]?.content?.parts || [];
+            for (const p of parts) {
+              if (p.text) {
+                answer += p.text;
+                target.textContent = answer;
+                scroll();
+              }
+            }
+          } catch (e) { /* partial chunk, ignore */ }
+        }
+      }
+
+      if (answer) {
+        history.push({ role: 'model', parts: [{ text: answer }] });
+        line('\n\n', 'dim');
+      } else {
+        line('\n(silence — the Oracle answered nothing)\n\n', 'warn');
+        console.log('ORACLE9 empty answer — history sent was:', JSON.stringify(history));
+      }
+      if (history.length > 24) history = history.slice(-16); // trim memory
+        break; // answered — leave the retry loop
+        } finally { clearTimeout(timer); }
+      }
+    } catch (err) {
+      line('\n!! CONNECTION SEVERED: ' + err.message + '\n\n', 'err');
+      history.pop();
+    }
+    busy = false;
+    statusEl.textContent = 'IDLE';
+  }
+
+  inEl.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter' && !busy) {
+      const text = inEl.value.trim();
+      if (!text) return;
+      inEl.value = '';
+      await send(text);
+    }
+  });
+})();
+</script>
+</body>
+</html>
